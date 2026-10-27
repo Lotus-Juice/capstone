@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bookworm Platform: AWS App Runner Serverless Container Service with VPC Connector, Autoscaling, Health Checks, and Secrets Integration.'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Target deployment environment.'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID for App Runner private egress.'
+
+  AppSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of at least 2 private subnets for App Runner VPC Connector.'
+
+  ImageUri:
+    Type: String
+    Description: 'Full ECR Image URI (e.g., 123456789012.dkr.ecr.ap-south-1.amazonaws.com/bookworm-backend-prod:latest).'
+
+  EcrAccessRoleArn:
+    Type: String
+    Description: 'IAM Role ARN for App Runner to pull images from ECR.'
+
+  InstanceRoleArn:
+    Type: String
+    Description: 'IAM Role ARN for Spring Boot runtime container instance.'
+
+  AppSecretsArn:
+    Type: String
+    Description: 'ARN of Secrets Manager secret containing database and application secrets.'
+
+  DatabaseEndpoint:
+    Type: String
+    Description: 'RDS PostgreSQL database hostname/endpoint.'
+
+  DatabasePort:
+    Type: String
+    Default: '5432'
+    Description: 'RDS PostgreSQL database port.'
+
+  CpuSize:
+    Type: String
+    Default: '2 vCPU'
+    AllowedValues:
+      - '0.25 vCPU'
+      - '0.5 vCPU'
+      - '1 vCPU'
+      - '2 vCPU'
+      - '4 vCPU'
+    Description: 'vCPU allocation per container instance.'
+
+  MemorySize:
+    Type: String
+    Default: '4 GB'
+    AllowedValues:
+      - '0.5 GB'
+      - '1 GB'
+      - '2 GB'
+      - '3 GB'
+      - '4 GB'
+      - '6 GB'
+      - '8 GB'
+      - '10 GB'
+      - '12 GB'
+    Description: 'Memory allocation per container instance.'
+
+  MinInstances:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Minimum provisioned container instances.'
+
+  MaxInstances:
+    Type: Number
+    Default: 25
+    MinValue: 2
+    MaxValue: 100
+    Description: 'Maximum auto-scaling container ceiling.'
+
+  MaxConcurrency:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 200
+    Description: 'Maximum concurrent requests per instance before triggering scale out.'
+
+Resources:
+  # ----------------------------------------------------------------------------
+  # 1. Security Group for App Runner VPC Connector (Outbound Egress)
+  # ----------------------------------------------------------------------------
+  AppRunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for App Runner VPC Connector (${Environment})'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+          Description: 'Allow outbound TCP to RDS in VPC'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow HTTPS egress to AWS services and external APIs'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub 'bookworm-${Environment}-apprunner-sg'
+
+  # ----------------------------------------------------------------------------
+  # 2. App Runner VPC Connector (Enables Private Subnet & RDS Connectivity)
+  # ----------------------------------------------------------------------------
+  VpcConnector:
+    Type: AWS::AppRunner::VpcConnector
+    Properties:
+      VpcConnectorName: !Sub 'bookworm-${Environment}-vpc-connector'
+      Subnets: !Ref AppSubnetIds
+      SecurityGroups:
+        - !GetAtt AppRunnerSecurityGroup.GroupId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Bookworm
+
+  # ----------------------------------------------------------------------------
+  # 3. App Runner Auto-Scaling Configuration
+  # ----------------------------------------------------------------------------
+  AutoScalingConfiguration:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: !Sub 'bookworm-${Environment}-autoscaling'
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      MaxConcurrency: !Ref MaxConcurrency
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 4. AWS App Runner Service
+  # ----------------------------------------------------------------------------
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    Properties:
+      ServiceName: !Sub 'bookworm-${Environment}-api'
+      SourceConfiguration:
+        AutoDeploymentsEnabled: true
+        AuthenticationConfiguration:
+          AccessRoleArn: !Ref EcrAccessRoleArn
+        ImageRepository:
+          ImageIdentifier: !Ref ImageUri
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: '8080'
+            RuntimeEnvironmentVariables:
+              - Name: SPRING_PROFILES_ACTIVE
+                Value: !Ref Environment
+              - Name: SPRING_DATASOURCE_URL
+                Value: !Sub 'jdbc:postgresql://${DatabaseEndpoint}:${DatabasePort}/bookworm?sslmode=require'
+              - Name: SPRING_DATASOURCE_USERNAME
+                Value: '{{resolve:secretsmanager:' !Sub '${AppSecretsArn}:SecretString:username}}'
+              - Name: SPRING_JPA_HIBERNATE_DDL_AUTO
+                Value: validate
+              - Name: SERVER_PORT
+                Value: '8080'
+            RuntimeEnvironmentSecrets:
+              - Name: SPRING_DATASOURCE_PASSWORD
+                Value: !Sub '${AppSecretsArn}:password::'
+              - Name: JWT_SECRET
+                Value: !Sub '${AppSecretsArn}:jwt_secret::'
+              - Name: PAYMENT_WEBHOOK_SECRET
+                Value: !Sub '${AppSecretsArn}:payment_webhook_secret::'
+      InstanceConfiguration:
+        Cpu: !Ref CpuSize
+        Memory: !Ref MemorySize
+        InstanceRoleArn: !Ref InstanceRoleArn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /actuator/health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 3
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: VPC
+          VpcConnectorArn: !GetAtt VpcConnector.VpcConnectorArn
+      AutoScalingConfigurationArn: !GetAtt AutoScalingConfiguration.AutoScalingConfigurationArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Bookworm
+
+Outputs:
+  ServiceUrl:
+    Description: 'Public HTTPS URL for the Bookworm App Runner API'
+    Value: !Sub 'https://${AppRunnerService.ServiceUrl}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceUrl'
+
+  ServiceArn:
+    Description: 'ARN of the created App Runner Service'
+    Value: !GetAtt AppRunnerService.ServiceArn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceArn'
+
+  AppRunnerSecurityGroupId:
+    Description: 'Security Group ID for App Runner Egress'
+    Value: !GetAtt AppRunnerSecurityGroup.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-AppRunnerSecurityGroupId'

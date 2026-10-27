@@ -1,0 +1,107 @@
+# ==============================================================================
+# GitHub Actions: Manual Rollback Workflow for AWS App Runner
+# Trigger: workflow_dispatch (Manual trigger with target image tag)
+# ==============================================================================
+
+name: Manual Production Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment to Roll Back'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      target_image_tag:
+        description: 'Specific ECR Image Tag to Roll Back to (e.g., prod-a1b2c3d-20250101120000)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for manual rollback'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: bookworm-backend
+
+jobs:
+  execute-rollback:
+    name: Execute Manual Rollback
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Select Target Environment Role & Service ARN
+        id: env_config
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "role_arn=${{ secrets.AWS_PROD_ROLE_ARN }}" >> $GITHUB_OUTPUT
+            echo "service_arn=${{ secrets.APPRUNNER_PROD_SERVICE_ARN }}" >> $GITHUB_OUTPUT
+            echo "env_suffix=prod" >> $GITHUB_OUTPUT
+          else
+            echo "role_arn=${{ secrets.AWS_STAGING_ROLE_ARN }}" >> $GITHUB_OUTPUT
+            echo "service_arn=${{ secrets.APPRUNNER_STAGING_SERVICE_ARN }}" >> $GITHUB_OUTPUT
+            echo "env_suffix=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env_config.outputs.role_arn }}
+          role-session-name: BookwormManualRollback
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify Target Image Exists in ECR
+        run: |
+          REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          REPO="${{ env.ECR_REPOSITORY }}-${{ steps.env_config.outputs.env_suffix }}"
+          TAG="${{ inputs.target_image_tag }}"
+          
+          echo "Verifying image existence: $REGISTRY/$REPO:$TAG"
+          aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" > /dev/null
+          echo "Target rollback image found in ECR."
+
+      - name: Roll Back App Runner Service Image
+        run: |
+          SERVICE_ARN="${{ steps.env_config.outputs.service_arn }}"
+          REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          REPO="${{ env.ECR_REPOSITORY }}-${{ steps.env_config.outputs.env_suffix }}"
+          TARGET_IMAGE="$REGISTRY/$REPO:${{ inputs.target_image_tag }}"
+          
+          echo "Initiating service update to rollback image: $TARGET_IMAGE"
+          aws apprunner update-service \
+            --service-arn "$SERVICE_ARN" \
+            --source-configuration "ImageRepository={ImageIdentifier=$TARGET_IMAGE,ImageRepositoryType=ECR,ImageConfiguration={Port='8080'}}"
+
+      - name: Wait for Rollback Deployment Completion
+        run: |
+          SERVICE_ARN="${{ steps.env_config.outputs.service_arn }}"
+          echo "Waiting for rollback deployment to complete..."
+          
+          for i in {1..35}; do
+            STATUS=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.Status' --output text)
+            echo "Status: $STATUS (Poll $i/35)"
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "Rollback successfully deployed!"
+              exit 0
+            elif [ "$STATUS" = "OPERATION_IN_PROGRESS" ]; then
+              sleep 15
+            else
+              echo "Rollback ended in unexpected state: $STATUS"
+              exit 1
+            fi
+          done
+          echo "Rollback timed out."
+          exit 1

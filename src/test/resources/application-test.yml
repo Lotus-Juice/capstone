@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: bookworm-backend-test
+  datasource:
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+app:
+  jwt:
+    secret: bookwormTestSecretKeyMustBeAtLeast256BitsLongForHMACSHA256TestingPurposes!
+    expiration-ms: 3600000 # 1 hour
+    refresh-expiration-ms: 86400000 # 24 hours
+  payment:
+    webhook-secret: whsec_test_mock_key_2025
+
+logging:
+  level:
+    root: WARN
+    com.bookworm: INFO

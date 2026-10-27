@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bookworm Platform: Amazon ECR Repository with Enhanced Vulnerability Scanning, KMS Encryption, and Lifecycle Policies.'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Target deployment environment.'
+
+  RepositoryName:
+    Type: String
+    Default: bookworm-backend
+    Description: 'Name of the ECR container repository.'
+
+  MaxImageCount:
+    Type: Number
+    Default: 30
+    Description: 'Maximum number of tagged images to retain before pruning.'
+
+Resources:
+  # ----------------------------------------------------------------------------
+  # KMS Key for ECR Repository Encryption at Rest
+  # ----------------------------------------------------------------------------
+  EcrKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS CMK for ECR Repository encryption - ${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: ecr-key-policy
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowECRService
+            Effect: Allow
+            Principal:
+              Service: !Sub 'ecr.${AWS::URLSuffix}'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+  EcrKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/bookworm-${Environment}-ecr-key'
+      TargetKeyId: !Ref EcrKmsKey
+
+  # ----------------------------------------------------------------------------
+  # Amazon ECR Repository
+  # ----------------------------------------------------------------------------
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${RepositoryName}-${Environment}'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt EcrKmsKey.Arn
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Retain last ${MaxImageCount} tagged release images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v", "release", "prod", "main"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxImageCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Expire untagged images older than 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Bookworm
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  RepositoryArn:
+    Description: 'ARN of the created ECR Repository'
+    Value: !GetAtt ContainerRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryArn'
+
+  RepositoryUri:
+    Description: 'URI of the created ECR Repository'
+    Value: !GetAtt ContainerRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryUri'
+
+  KmsKeyArn:
+    Description: 'ARN of the KMS Key used for ECR encryption'
+    Value: !GetAtt EcrKmsKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EcrKmsKeyArn'

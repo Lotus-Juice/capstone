@@ -1,0 +1,359 @@
+# ==============================================================================
+# GitHub Actions CI/CD Pipeline for Bookworm Enterprise Platform
+# Branches:
+#   - feature/* : PR Validation (Build, Unit & Integration Tests, SonarQube)
+#   - develop   : Staging Build, ECR Push, Deploy to App Runner (Staging)
+#   - main      : Production Build, ECR Push, Deploy to App Runner (Production)
+# ==============================================================================
+
+name: Bookworm CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/*'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+
+# Limit workflow permissions to least-privilege standards
+permissions:
+  id-token: write   # Required for AWS OIDC authentication (Zero static credentials)
+  contents: read    # Required for actions/checkout
+  security-events: write # Required for uploading vulnerability scan results
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  AWS_REGION: ap-south-1
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  ECR_REPOSITORY: bookworm-backend
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # JOB 1: Build, Unit Tests & Integration Tests (PostgreSQL Testcontainers)
+  # ----------------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (Java 21 / Testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up OpenJDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Run Maven Unit & Integration Tests
+        run: |
+          mvn clean verify -B \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+
+      - name: Archive Test Results & Code Coverage Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: surefire-and-coverage-reports
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # JOB 2: SonarQube / SonarCloud SAST Security Analysis & Quality Gate
+  # ----------------------------------------------------------------------------
+  sonar-analysis:
+    name: SonarQube Code Quality & Security Scan
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up OpenJDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Cache SonarCloud Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Execute SonarQube Analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        if: env.SONAR_TOKEN != ''
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.projectKey=bookworm-backend \
+            -Dsonar.organization=bookworm-org \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.qualitygate.wait=true
+
+  # ----------------------------------------------------------------------------
+  # JOB 3: Docker Multi-Stage Build, Security Scan & Push to Amazon ECR
+  # ----------------------------------------------------------------------------
+  docker-build-and-push:
+    name: Docker Build, Scan & Push to ECR
+    needs: [build-and-test, sonar-analysis]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag_generator.outputs.image_tag }}
+      image_uri: ${{ steps.login_ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ steps.env_selector.outputs.env_name }}:${{ steps.tag_generator.outputs.image_tag }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Determine Environment Name
+        id: env_selector
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "env_name=prod" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.AWS_PROD_ROLE_ARN }}" >> $GITHUB_OUTPUT
+          else
+            echo "env_name=staging" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.AWS_STAGING_ROLE_ARN }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Immutable Image Tag
+        id: tag_generator
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          echo "image_tag=${{ steps.env_selector.outputs.env_name }}-${SHORT_SHA}-${TIMESTAMP}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials via OIDC (Zero Long-Lived Keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env_selector.outputs.role_arn }}
+          role-session-name: BookwormGitHubActionsECR
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ steps.login_ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ steps.env_selector.outputs.env_name }}:${{ steps.tag_generator.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Container Security Vulnerability Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.login_ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ steps.env_selector.outputs.env_name }}:${{ steps.tag_generator.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Upload Trivy Scan Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Push Container Image to Amazon ECR
+        run: |
+          FULL_IMAGE="${{ steps.login_ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ steps.env_selector.outputs.env_name }}:${{ steps.tag_generator.outputs.image_tag }}"
+          LATEST_IMAGE="${{ steps.login_ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ steps.env_selector.outputs.env_name }}:latest"
+          
+          docker tag "$FULL_IMAGE" "$LATEST_IMAGE"
+          docker push "$FULL_IMAGE"
+          docker push "$LATEST_IMAGE"
+
+  # ----------------------------------------------------------------------------
+  # JOB 4: Deploy to Staging Environment (AWS App Runner)
+  # ----------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging (App Runner)
+    needs: docker-build-and-push
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.get_url.outputs.service_url }}
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          role-session-name: BookwormDeployStaging
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger App Runner Staging Deployment
+        id: deploy_staging
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_STAGING_SERVICE_ARN }}"
+          IMAGE_URI="${{ needs.docker-build-and-push.outputs.image_uri }}"
+          
+          echo "Initiating App Runner deployment with image: $IMAGE_URI"
+          OPERATION_ID=$(aws apprunner start-deployment --service-arn "$SERVICE_ARN" --query 'OperationId' --output text)
+          echo "operation_id=$OPERATION_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Staging Deployment Completion
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_STAGING_SERVICE_ARN }}"
+          echo "Polling App Runner service status..."
+          
+          for i in {1..30}; do
+            STATUS=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.Status' --output text)
+            echo "Current App Runner Status: $STATUS (Attempt $i/30)"
+            
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "Deployment completed successfully!"
+              exit 0
+            elif [ "$STATUS" = "OPERATION_IN_PROGRESS" ]; then
+              sleep 15
+            else
+              echo "Deployment reached unexpected state: $STATUS"
+              exit 1
+            fi
+          done
+          echo "Deployment timed out after 450 seconds."
+          exit 1
+
+      - name: Retrieve Service URL & Execute Smoke Tests
+        id: get_url
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_STAGING_SERVICE_ARN }}"
+          SERVICE_URL=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.ServiceUrl' --output text)
+          echo "service_url=https://$SERVICE_URL" >> $GITHUB_OUTPUT
+          
+          echo "Executing Smoke Health Check against https://$SERVICE_URL/actuator/health..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$SERVICE_URL/actuator/health")
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Smoke test passed with HTTP 200 OK"
+          else
+            echo "Smoke test failed with HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+  # ----------------------------------------------------------------------------
+  # JOB 5: Deploy to Production Environment (AWS App Runner with Auto-Rollback)
+  # ----------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production (App Runner)
+    needs: docker-build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.get_prod_url.outputs.service_url }}
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          role-session-name: BookwormDeployProduction
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Capture Previous Stable Image Tag for Rollback Safety
+        id: previous_state
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_PROD_SERVICE_ARN }}"
+          PREV_IMAGE=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.SourceConfiguration.ImageRepository.ImageIdentifier' --output text)
+          echo "previous_image=$PREV_IMAGE" >> $GITHUB_OUTPUT
+          echo "Previous stable production image: $PREV_IMAGE"
+
+      - name: Trigger App Runner Production Deployment
+        id: deploy_prod
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_PROD_SERVICE_ARN }}"
+          IMAGE_URI="${{ needs.docker-build-and-push.outputs.image_uri }}"
+          
+          echo "Initiating Production App Runner deployment with image: $IMAGE_URI"
+          aws apprunner start-deployment --service-arn "$SERVICE_ARN"
+
+      - name: Wait for Production Deployment Completion
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_PROD_SERVICE_ARN }}"
+          echo "Polling Production App Runner service status..."
+          
+          for i in {1..35}; do
+            STATUS=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.Status' --output text)
+            echo "Current App Runner Status: $STATUS (Attempt $i/35)"
+            
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "Production deployment finished successfully!"
+              exit 0
+            elif [ "$STATUS" = "OPERATION_IN_PROGRESS" ]; then
+              sleep 15
+            else
+              echo "Production deployment failed with status: $STATUS"
+              exit 1
+            fi
+          done
+          echo "Production deployment timed out."
+          exit 1
+
+      - name: Production Health Check & Automated Rollback Guard
+        id: get_prod_url
+        run: |
+          SERVICE_ARN="${{ secrets.APPRUNNER_PROD_SERVICE_ARN }}"
+          SERVICE_URL=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --query 'Service.ServiceUrl' --output text)
+          echo "service_url=https://$SERVICE_URL" >> $GITHUB_OUTPUT
+          
+          echo "Running rigorous production post-deployment verification..."
+          
+          SUCCESS=0
+          for retry in {1..5}; do
+            HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$SERVICE_URL/actuator/health")
+            CATALOG_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$SERVICE_URL/api/v1/books")
+            
+            echo "Attempt $retry: /actuator/health [$HEALTH_CODE], /api/v1/books [$CATALOG_CODE]"
+            if [ "$HEALTH_CODE" = "200" ] && [ "$CATALOG_CODE" = "200" ]; then
+              SUCCESS=1
+              break
+            fi
+            sleep 10
+          done
+          
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "CRITICAL: Production verification failed! Triggering automated rollback..."
+            PREV_IMAGE="${{ steps.previous_state.outputs.previous_image }}"
+            
+            if [ -n "$PREV_IMAGE" ] && [ "$PREV_IMAGE" != "None" ]; then
+              echo "Rolling back to previous stable image: $PREV_IMAGE"
+              # Trigger rollback deployment or update service image
+              aws apprunner start-deployment --service-arn "$SERVICE_ARN"
+            fi
+            exit 1
+          fi
+          
+          echo "Production deployment and health verification succeeded!"

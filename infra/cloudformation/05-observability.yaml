@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bookworm Platform: Amazon CloudWatch Log Groups, Alarms, Metrics, and SNS Alerting.'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Target deployment environment.'
+
+  AppRunnerServiceName:
+    Type: String
+    Default: bookworm-prod-api
+    Description: 'Name of the App Runner Service to monitor.'
+
+  KmsKeyArn:
+    Type: String
+    Description: 'ARN of KMS CMK for CloudWatch Logs encryption at rest.'
+
+  AlertEmail:
+    Type: String
+    Default: sre-alerts@bookworm.example.com
+    Description: 'Email address for critical CloudWatch alarms and incident notifications.'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ----------------------------------------------------------------------------
+  # 1. Amazon CloudWatch Log Group
+  # ----------------------------------------------------------------------------
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apprunner/${AppRunnerServiceName}/application'
+      RetentionInDays: !If [IsProduction, 90, 14]
+      KmsKeyId: !Ref KmsKeyArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Bookworm
+
+  # ----------------------------------------------------------------------------
+  # 2. SNS Topic for Ops & SRE Incident Notifications
+  # ----------------------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bookworm-${Environment}-sre-alerts'
+      KmsMasterKeyId: !Ref KmsKeyArn
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 3. CloudWatch Alarm: High CPU Utilization (> 80%)
+  # ----------------------------------------------------------------------------
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bookworm-${Environment}-high-cpu-utilization'
+      AlarmDescription: 'Triggers when App Runner CPU utilization exceeds 80% for 5 minutes'
+      Namespace: AWS/AppRunner
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref AppRunnerServiceName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # ----------------------------------------------------------------------------
+  # 4. CloudWatch Alarm: High Memory Utilization (> 80%)
+  # ----------------------------------------------------------------------------
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bookworm-${Environment}-high-memory-utilization'
+      AlarmDescription: 'Triggers when App Runner Memory utilization exceeds 80% for 5 minutes'
+      Namespace: AWS/AppRunner
+      MetricName: MemoryUtilization
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref AppRunnerServiceName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # ----------------------------------------------------------------------------
+  # 5. CloudWatch Alarm: High 5xx HTTP Error Rate
+  # ----------------------------------------------------------------------------
+  High5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bookworm-${Environment}-high-5xx-error-rate'
+      AlarmDescription: 'Triggers when HTTP 5xx responses occur more than 5 times in a 1-minute window'
+      Namespace: AWS/AppRunner
+      MetricName: 5xxStatusResponses
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref AppRunnerServiceName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # ----------------------------------------------------------------------------
+  # 6. CloudWatch Alarm: High Request Latency (p95 > 1500ms)
+  # ----------------------------------------------------------------------------
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bookworm-${Environment}-high-request-latency'
+      AlarmDescription: 'Triggers when p95 request latency exceeds 1.5 seconds over 5 minutes'
+      Namespace: AWS/AppRunner
+      MetricName: RequestLatency
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref AppRunnerServiceName
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1500
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  LogGroupArn:
+    Description: 'ARN of the Application CloudWatch Log Group'
+    Value: !GetAtt ApplicationLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLogGroupArn'
+
+  AlertsTopicArn:
+    Description: 'ARN of the SRE Alerts SNS Topic'
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopicArn'

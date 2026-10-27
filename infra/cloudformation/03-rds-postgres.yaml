@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bookworm Platform: Amazon RDS Multi-AZ PostgreSQL 16 with Storage Autoscaling, Forced SSL, and KMS Encryption.'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Target deployment environment.'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where RDS will be deployed.'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of at least 2 private/isolated Subnet IDs across distinct AZs for DB Subnet Group.'
+
+  AppRunnerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: 'Security Group ID of App Runner VPC Connector.'
+
+  SecretsArn:
+    Type: String
+    Description: 'ARN of Secrets Manager secret containing database master password.'
+
+  KmsKeyArn:
+    Type: String
+    Description: 'ARN of KMS CMK for storage encryption.'
+
+  DBInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    Description: 'RDS instance compute size (e.g., db.t4g.medium for dev, db.r6g.large for prod).'
+
+  AllocatedStorageGB:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: 'Initial allocated GP3 storage in GB.'
+
+  MaxAllocatedStorageGB:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 5000
+    Description: 'Maximum storage autoscaling ceiling in GB.'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ----------------------------------------------------------------------------
+  # 1. Database Security Group (Private, Inbound restricted to App Runner)
+  # ----------------------------------------------------------------------------
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for Bookworm PostgreSQL Database (${Environment})'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppRunnerSecurityGroupId
+          Description: 'Allow inbound PostgreSQL traffic from App Runner VPC Connector only'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: 'Block outbound traffic from database tier'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub 'bookworm-${Environment}-rds-sg'
+
+  # ----------------------------------------------------------------------------
+  # 2. RDS DB Subnet Group
+  # ----------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub 'bookworm-${Environment}-db-subnet-group'
+      DBSubnetGroupDescription: !Sub 'Private subnets for Bookworm RDS (${Environment})'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 3. RDS Parameter Group (Force SSL/TLS 1.3 encryption in transit)
+  # ----------------------------------------------------------------------------
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: postgres16
+      Description: !Sub 'PostgreSQL 16 parameter group with enforced TLS for Bookworm (${Environment})'
+      Parameters:
+        rds.force_ssl: '1'
+        log_connections: '1'
+        log_disconnections: '1'
+        log_duration: '1'
+        log_min_duration_statement: '1000' # Log queries taking longer than 1 second
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 4. Amazon RDS PostgreSQL 16 DB Instance
+  # ----------------------------------------------------------------------------
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub 'bookworm-${Environment}-db'
+      Engine: postgres
+      EngineVersion: '16.4'
+      DBInstanceClass: !Ref DBInstanceClass
+      MultiAZ: !If [IsProduction, true, false]
+      AllocatedStorage: !Ref AllocatedStorageGB
+      MaxAllocatedStorage: !Ref MaxAllocatedStorageGB
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref KmsKeyArn
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      DBParameterGroupName: !Ref DBParameterGroup
+      DBName: bookworm
+      MasterUsername: '{{resolve:secretsmanager:' !Sub '${SecretsArn}:SecretString:username}}'
+      MasterUserPassword: '{{resolve:secretsmanager:' !Sub '${SecretsArn}:SecretString:password}}'
+      BackupRetentionPeriod: !If [IsProduction, 30, 7]
+      PreferredBackupWindow: '20:00-21:00'
+      PreferredMaintenanceWindow: 'sun:22:00-sun:23:00'
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PerformanceInsightsKMSKeyId: !Ref KmsKeyArn
+      DeletionProtection: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Bookworm
+
+Outputs:
+  DatabaseEndpoint:
+    Description: 'RDS PostgreSQL connection endpoint address'
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: 'RDS PostgreSQL connection port'
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  DatabaseSecurityGroupId:
+    Description: 'Security Group ID for RDS instance'
+    Value: !GetAtt DatabaseSecurityGroup.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroupId'
